@@ -228,11 +228,22 @@ app = Flask(__name__)
 @app.route('/')
 def ana_sayfa(): return "Bot Başarıyla Çalışıyor! (v2.0)"
 
+import datetime
+
 def otomatik_tarama():
     while True:
-        for hisse in HISSELER: 
-            analiz_et(hisse, rapor_modu=False)
-        time.sleep(3600)
+        # Render sunucusu yabancı olduğu için saati Türkiye'ye (UTC+3) göre ayarlıyoruz
+        tr_saati = datetime.datetime.utcnow() + datetime.timedelta(hours=3)
+        gun_indeksi = tr_saati.weekday() # 0: Pazartesi, 1: Salı ... 5: Cumartesi, 6: Pazar
+        
+        # Eğer gün Pazartesi ile Cuma arasındaysa (indeks 5'ten küçükse) tarama yap
+        if gun_indeksi < 5:
+            for hisse in HISSELER: 
+                analiz_et(hisse, rapor_modu=False)
+        else:
+            print(f"Hafta sonu modu aktif. Otomatik sinyaller Pazartesiye kadar durduruldu.")
+            
+        time.sleep(3600) # Her halükarda 1 saat bekle
 
 def bot_dinle():
     bot.infinity_polling()
@@ -242,3 +253,4 @@ if __name__ == "__main__":
     threading.Thread(target=bot_dinle, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
