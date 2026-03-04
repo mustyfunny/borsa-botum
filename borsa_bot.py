@@ -5,17 +5,20 @@ import time
 import threading
 import warnings
 import os
+import requests
+import datetime
 from flask import Flask
 
 warnings.filterwarnings("ignore")
 
-from ta.trend import MACD, SMAIndicator
+from ta.trend import MACD, SMAIndicator, EMAIndicator
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands, AverageTrueRange
 
-# --- BURAYA KENDİ BİLGİLERİNİ GİR ---
+# --- AYARLAR ---
 TELEGRAM_TOKEN = "8752151248:AAHgKlGYhGReXPkut4zIYqimAtbaVTdiiG0"
 CHAT_ID = "5224140684"
+TWELVEDATA_API_KEY = "91485fe483ee42a68c7e0471479d45ae" # YENİ EKLENDİ
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
@@ -38,7 +41,7 @@ def hisseleri_kaydet(liste):
 
 HISSELER = hisseleri_yukle()
 
-# --- YENİ (v2.0): ENDEKS KONTROL SİSTEMİ (Önbellekli) ---
+# --- ENDEKS KONTROL SİSTEMİ (Önbellekli) ---
 ENDEKS_CACHE = {
     "SPY": {"boga_mi": True, "son_guncelleme": 0},
     "XU100.IS": {"boga_mi": True, "son_guncelleme": 0}
@@ -48,7 +51,6 @@ def endeks_durumu_getir(para_birimi):
     sembol = "XU100.IS" if para_birimi == "₺" else "SPY"
     su_an = time.time()
     
-    # API'yi yormamak için endeks verisini 1 saat (3600 sn) önbellekte tutarız
     if su_an - ENDEKS_CACHE[sembol]["son_guncelleme"] > 3600:
         try:
             data = yf.download(sembol, period="3mo", interval="1d", progress=False)
@@ -57,15 +59,68 @@ def endeks_durumu_getir(para_birimi):
                 ma50 = SMAIndicator(close=kapanis, window=50).sma_indicator()
                 fiyat = float(kapanis.iloc[-1])
                 son_ma50 = float(ma50.iloc[-1])
-                # Fiyat 50 günlük ortalamanın üstündeyse Boğa (Güvenli), altındaysa Ayı (Riskli) piyasası
                 ENDEKS_CACHE[sembol]["boga_mi"] = fiyat > son_ma50
                 ENDEKS_CACHE[sembol]["son_guncelleme"] = su_an
         except Exception:
-            pass # Hata olursa eski veriyi (veya varsayılanı) kullanmaya devam et
+            pass 
             
     return ENDEKS_CACHE[sembol]["boga_mi"]
 
+# --- 1. KISIM: VARANT (ALTIN/GÜMÜŞ) ANALİZİ (YENİ) ---
+def emtia_analiz_et(sembol, isim):
+    url = f"https://api.twelvedata.com/time_series?symbol={sembol}&interval=5min&outputsize=50&apikey={TWELVEDATA_API_KEY}"
+    try:
+        response = requests.get(url).json()
+        if "values" not in response:
+            return {"hata": f"⚠️ {isim} verisi çekilemedi. API limitine takılmış olabilirsiniz."}
 
+        df = pd.DataFrame(response["values"])
+        df = df.iloc[::-1].reset_index(drop=True)
+        for col in ['close', 'high', 'low']:
+            df[col] = df[col].astype(float)
+
+        kapanis = df['close']
+        yuksek = df['high']
+        dusuk = df['low']
+
+        rsi = RSIIndicator(close=kapanis, window=14).rsi()
+        ema = EMAIndicator(close=kapanis, window=14).ema_indicator()
+        atr = AverageTrueRange(high=yuksek, low=dusuk, close=kapanis, window=14).average_true_range()
+        macd = MACD(close=kapanis)
+
+        fiyat = float(kapanis.iloc[-1])
+        son_rsi = round(float(rsi.iloc[-1]), 1)
+        son_ema = float(ema.iloc[-1])
+        son_atr = float(atr.iloc[-1])
+        macd_line = float(macd.macd().iloc[-1])
+        signal_line = float(macd.macd_signal().iloc[-1])
+
+        trend = "YÜKSELİŞ 🟢" if fiyat > son_ema else "DÜŞÜŞ 🔴"
+        macd_yorum = "AL (Pozitif Kesişim)" if macd_line > signal_line else "SAT (Negatif Kesişim)"
+        
+        if son_rsi > 70: rsi_yorum = "AŞIRI ALIM! ⚠️ (Düşüş Gelebilir)"
+        elif son_rsi < 30: rsi_yorum = "AŞIRI SATIM! 🟢 (Alım Fırsatı)"
+        else: rsi_yorum = "Nötr Bölge"
+
+        zarar_kes = round(fiyat - (son_atr * 1.5), 2)
+        kar_al = round(fiyat + (son_atr * 3.0), 2)
+
+        rapor = (
+            f"🪙 **{isim} ({sembol}) 5 DAKİKALIK ANALİZ** 🪙\n"
+            f"💰 Anlık Fiyat: **${fiyat:.2f}**\n\n"
+            f"📉 **Teknik Durum:**\n"
+            f"• Ana Trend (EMA 14): {trend}\n"
+            f"• MACD: {macd_yorum}\n"
+            f"• RSI (14): {son_rsi} -> {rsi_yorum}\n\n"
+            f"🎯 **Günlük Varant Hedefleri (ATR Bazlı):**\n"
+            f"🟢 Kar Al (TP): ${kar_al:.2f}\n"
+            f"🔴 Zarar Kes (SL): ${zarar_kes:.2f}"
+        )
+        return {"rapor": rapor, "fiyat": fiyat, "rsi": son_rsi}
+    except Exception as e:
+        return {"hata": f"❌ {isim} analiz hatası: {e}"}
+
+# --- 2. KISIM: HİSSE ANALİZİ (MEVCUT) ---
 def analiz_et(ticker, rapor_modu=False):
     try:
         data = yf.download(ticker, period="1y", interval="1d", progress=False)
@@ -74,8 +129,6 @@ def analiz_et(ticker, rapor_modu=False):
             return None
 
         para_birimi = "₺" if ticker.endswith(".IS") else "$"
-        
-        # YENİ (v2.0): Hissenin bağlı olduğu endeksin sağlığını kontrol et
         endeks_guvenli_mi = endeks_durumu_getir(para_birimi)
 
         kapanis = data['Close'].squeeze()
@@ -110,7 +163,6 @@ def analiz_et(ticker, rapor_modu=False):
         son_ma50 = round(float(ma50.iloc[-1]), 3) if not pd.isna(ma50.iloc[-1]) else 0
         son_ma200 = round(float(ma200.iloc[-1]), 3) if not pd.isna(ma200.iloc[-1]) else 0
 
-        # YENİ (v2.0): Hacim Patlaması Kontrolü (Ortalamanın 3 katı)
         hacim_anormal_mi = son_hacim > (ort_hacim * 3)
 
         skor = 0
@@ -124,7 +176,6 @@ def analiz_et(ticker, rapor_modu=False):
         if fiyat > son_ma200 and son_ma200 != 0: skor += 10
         if fiyat <= (bb_alt * 1.05): skor += 10
 
-        # YENİ (v2.0): Endeks Ayı piyasasındaysa riski azaltmak için skoru cezalandır
         if not endeks_guvenli_mi:
             skor -= 10 
 
@@ -137,7 +188,6 @@ def analiz_et(ticker, rapor_modu=False):
         rapor += f"💲 **Anlık Fiyat:** {para_birimi}{fiyat}\n"
         rapor += f"🎯 **Sistem Skoru:** {skor}/100 ({durum_ikonu})\n\n"
         
-        # v2.0 Raporlama Eklemeleri
         if not endeks_guvenli_mi:
             rapor += f"⚠️ **ENDEKS UYARISI:** Piyasa genel trendi şu an DÜŞÜŞTE (MA50 Altında). İşlem açmak ekstra risklidir!\n\n"
         else:
@@ -152,7 +202,6 @@ def analiz_et(ticker, rapor_modu=False):
         rapor += f"▫️ Bollinger: {'🟢 Alt Banda Yakın' if fiyat <= (bb_alt * 1.05) else '⚪ Bant İçinde'}\n\n"
         rapor += f"🛡️ **AKSİYON PLANI (ATR)**\n🛑 Zarar Kes: {para_birimi}{zarar_kes}\n💰 Hedef Kar: {para_birimi}{kar_al}\n"
 
-        # Arka planda tựomatik fırsat yakalarsa (Normal puanı yüksekse VEYA hacim patlaması varsa haber ver)
         if not rapor_modu and (skor >= 75 or hacim_anormal_mi):
             bot.send_message(CHAT_ID, f"🚨 **OTOMATİK SİNYAL YAKALANDI** 🚨\n\n{rapor}")
 
@@ -164,14 +213,34 @@ def analiz_et(ticker, rapor_modu=False):
         return None
 
 # --- TELEGRAM KOMUTLARI ---
-@bot.message_handler(commands=['start', 'yardim', 'liste', 'ekle', 'sil', 'analiz', 'tara'])
+@bot.message_handler(commands=['start', 'yardim', 'liste', 'ekle', 'sil', 'analiz', 'tara', 'altin', 'gumus'])
 def komut_yoneticisi(message):
     komut = message.text.split()[0]
     try:
         if komut in ['/start', '/yardim']:
-            bot.reply_to(message, "🤖 Borsa Asistanı v2.0 Aktif! Komutlar: /liste, /ekle HISSE, /sil HISSE, /tara, /analiz HISSE")
+            yardim_metni = (
+                "🤖 Tüm Piyasalar Asistanı Aktif!\n\n"
+                "**Hisse Komutları:**\n"
+                "/liste - Takip listesini gör\n"
+                "/ekle HISSE - Listeye ekle (Örn: /ekle AAPL)\n"
+                "/sil HISSE - Listeden çıkar\n"
+                "/tara - Hisseleri hızlıca tara\n"
+                "/analiz HISSE - Detaylı hisse analizi\n\n"
+                "**Varant Komutları:**\n"
+                "/altin - Ons Altın 5 Dk Analiz\n"
+                "/gumus - Ons Gümüş 5 Dk Analiz"
+            )
+            bot.reply_to(message, yardim_metni)
+        elif komut == '/altin':
+            bot.reply_to(message, "⏳ Altın verileri çekiliyor...")
+            sonuc = emtia_analiz_et("XAU/USD", "Ons Altın")
+            bot.send_message(message.chat.id, sonuc.get("rapor", sonuc.get("hata")), parse_mode="Markdown")
+        elif komut == '/gumus':
+            bot.reply_to(message, "⏳ Gümüş verileri çekiliyor...")
+            sonuc = emtia_analiz_et("XAG/USD", "Ons Gümüş")
+            bot.send_message(message.chat.id, sonuc.get("rapor", sonuc.get("hata")), parse_mode="Markdown")
         elif komut == '/liste':
-            bot.reply_to(message, f"📋 Güncel Liste:\n{', '.join(HISSELER)}")
+            bot.reply_to(message, f"📋 Güncel Hisse Listesi:\n{', '.join(HISSELER)}")
         elif komut == '/ekle':
             hisse = message.text.split()[1].upper()
             if hisse not in HISSELER:
@@ -189,8 +258,8 @@ def komut_yoneticisi(message):
             sonuc = analiz_et(hisse, rapor_modu=True)
             bot.send_message(message.chat.id, sonuc['rapor'] if "hata" not in sonuc else sonuc['hata'])
         elif komut == '/tara':
-            bot.reply_to(message, "🔍 v2.0 Tarama başlatıldı (Piyasa Endeksi ve Hacim analizleri yapılıyor)...")
-            ozet = "📊 **HIZLI TARAMA ÖZETİ (v2.0)** 📊\n\n"
+            bot.reply_to(message, "🔍 Hisse Taraması başlatıldı...")
+            ozet = "📊 **HIZLI TARAMA ÖZETİ** 📊\n\n"
             firsatlar = []
             
             for h in HISSELER:
@@ -198,14 +267,12 @@ def komut_yoneticisi(message):
                 if s and "hata" not in s:
                     ikon = "🔥" if s['skor'] >= 75 else ("🟡" if s['skor'] >= 50 else "🛑")
                     
-                    # Özet listeye akıllı v2.0 ikonları ekleyelim
                     ek_uyari = ""
                     if not s['endeks_durum']: ek_uyari += " ⚠️"
                     if s['hacim_alarm']: ek_uyari += " 🚨"
                     
                     ozet += f"{ikon} **{h}:** {s['para_birimi']}{s['fiyat']} (Skor: {s['skor']}){ek_uyari}\n"
                     
-                    # Detayını atacağı hisseler: Skoru yüksek olanlar VEYA hacmi patlayanlar
                     if s['skor'] >= 75 or s['hacim_alarm']: 
                         firsatlar.append(s['rapor'])
                 elif s and "hata" in s:
@@ -214,7 +281,7 @@ def komut_yoneticisi(message):
             bot.send_message(message.chat.id, ozet)
             
             if firsatlar:
-                bot.send_message(message.chat.id, "🎯 DİKKAT ÇEKEN FIRSATLAR VE ALARMLAR:")
+                bot.send_message(message.chat.id, "🎯 DİKKAT ÇEKEN HİSSE FIRSATLARI:")
                 for r in firsatlar:
                     bot.send_message(message.chat.id, r)
                     time.sleep(0.5)
@@ -223,34 +290,50 @@ def komut_yoneticisi(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Hata: {e}")
 
-# --- ARKA PLAN VE RENDER WEB SUNUCUSU ---
+# --- ARKA PLAN SİSTEMLERİ VE FLASK ---
 app = Flask(__name__)
 @app.route('/')
-def ana_sayfa(): return "Bot Başarıyla Çalışıyor! (v2.0)"
+def ana_sayfa(): return "Bot Başarıyla Çalışıyor! (Tüm Piyasalar v3.0)"
 
-import datetime
-
-def otomatik_tarama():
+def otomatik_hisse_tarama():
     while True:
-        # Render sunucusu yabancı olduğu için saati Türkiye'ye (UTC+3) göre ayarlıyoruz
         tr_saati = datetime.datetime.utcnow() + datetime.timedelta(hours=3)
-        gun_indeksi = tr_saati.weekday() # 0: Pazartesi, 1: Salı ... 5: Cumartesi, 6: Pazar
+        gun_indeksi = tr_saati.weekday() 
         
-        # Eğer gün Pazartesi ile Cuma arasındaysa (indeks 5'ten küçükse) tarama yap
+        # Sadece Hafta İçi Hisse Taraması (1 Saatte Bir)
         if gun_indeksi < 5:
             for hisse in HISSELER: 
                 analiz_et(hisse, rapor_modu=False)
         else:
-            print(f"Hafta sonu modu aktif. Otomatik sinyaller Pazartesiye kadar durduruldu.")
+            print("Hafta sonu modu aktif. Hisse sinyalleri Pazartesiye kadar durduruldu.")
             
-        time.sleep(3600) # Her halükarda 1 saat bekle
+        time.sleep(3600) 
+
+def otomatik_emtia_tarama():
+    while True:
+        tr_saati = datetime.datetime.utcnow() + datetime.timedelta(hours=3)
+        gun_indeksi = tr_saati.weekday()
+        
+        # Sadece Hafta İçi Emtia Taraması (5 Dakikada Bir)
+        if gun_indeksi < 5:
+            for sembol, isim in [("XAU/USD", "ALTIN"), ("XAG/USD", "GÜMÜŞ")]:
+                sonuc = emtia_analiz_et(sembol, isim)
+                if "rsi" in sonuc:
+                    rsi = sonuc["rsi"]
+                    fiyat = sonuc["fiyat"]
+                    
+                    if rsi < 30:
+                        bot.send_message(CHAT_ID, f"🚨 **{isim} FIRSAT:** Aşırı Satım bölgesinde! (RSI: {rsi:.1f}). Fiyat: ${fiyat:.2f}", parse_mode="Markdown")
+                    elif rsi > 70:
+                        bot.send_message(CHAT_ID, f"⚠️ **{isim} RİSK:** Aşırı Alım bölgesinde! (RSI: {rsi:.1f}). Fiyat: ${fiyat:.2f}", parse_mode="Markdown")
+        time.sleep(300) 
 
 def bot_dinle():
     bot.infinity_polling()
 
 if __name__ == "__main__":
-    threading.Thread(target=otomatik_tarama, daemon=True).start()
+    threading.Thread(target=otomatik_hisse_tarama, daemon=True).start()
+    threading.Thread(target=otomatik_emtia_tarama, daemon=True).start()
     threading.Thread(target=bot_dinle, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
